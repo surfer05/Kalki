@@ -1,10 +1,16 @@
 import asyncio
 import threading
-from collections import defaultdict
+# from collections import defaultdict
 from aes_gcm import aes_encryption
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+import cryptography.exceptions
 import os
 import hashlib
+import random
+
+import networkx as nx
+import matplotlib.pyplot as plt
+
 
 # Number of participants
 n = 3
@@ -26,25 +32,13 @@ def KeyRoll(k, x):
     new_key = hashlib.sha256(combined).digest()
     return new_key
 
-
 def increment(index, dimension):
     new_index = list(index)
     new_index[dimension] += 1
     return tuple(new_index)
 
-
 class KeyLattice:
     def __init__(self, initial_key, dimension):
-        # self.index = index
-        # self.dimension = dimension
-        # self.lattice = {}
-        # self.lattice_lock = threading.Lock()
-        # initial_index = tuple([0]*self.dimension)
-        # self.pairwise_keys = pairwise_keys  # Now provided during initialization
-        # self.lattice[initial_index] = initial_key
-        # self.max_index = initial_index
-        # self.updates = []
-        # self.buffer = []
         self.dimension = dimension
         self.lattice = {}  # {(index_tuple): key}
         self.lattice_lock = threading.Lock()
@@ -52,19 +46,41 @@ class KeyLattice:
         self.lattice[initial_index] = initial_key
         self.max_index = initial_index
 
+        # For visualization
+        self.graph = nx.DiGraph()
+        self.graph.add_node(initial_index)
+
     def get_max_key(self):
-        # with self.lattice_lock:
         return self.lattice[self.max_index], self.max_index
 
-    def add_key(self, index, key):
-        # with self.lattice_lock:
+    def add_key(self, index, key, predecessor_index=None):
         self.lattice[index] = key
-        # Update the max_index if necessary
         self.update_max_index(index)
+
+        # Update the graph for visualization
+        self.graph.add_node(index)
+        if predecessor_index:
+            self.graph.add_edge(predecessor_index, index)
 
     def update_max_index(self, index):
         self.max_index = tuple(max(i, j)
         for i, j in zip(self.max_index, index))
+
+    def print_lattice(self):
+        print(f"Lattice state for dimension {self.dimension}:")
+        for index in sorted(self.lattice.keys()):
+            key= self.lattice[index]
+            # For demonstration, we'll show the key as a hex digest of its hash
+            key_repr = hashlib.sha256(key).hexdigest()[:8]
+            print(f"Index {index}: Key hash {key_repr}")
+        print()
+
+    def visualize_lattice(self, participant_index):
+        plt.figure(figsize=(8,6))
+        pos = nx.spring_layout(self.graph, seed=42) # Position nodes for visualization
+        nx.draw(self.graph, pos, with_labels=True, node_color='lightblue', arrows=True)
+        plt.title(f"Lattice Visualization for Participant {participant_index}")
+        plt.show()
 
 class Participant:
     def __init__(self, index, initial_key, participant_pairwise_keys):
@@ -75,13 +91,26 @@ class Participant:
         self.update_buffer = []
         self.received_updates = set()
 
-    async def send_update(self):
+    async def maybe_send_update(self, cycle):
+        if random.choice([True, False]):
+            await self.send_update(cycle)
+
+    async def send_update(self, cycle):
         x = os.urandom(32)
         with self.lattice.lattice_lock:
             current_key, current_index = self.lattice.get_max_key()
             new_index = increment(current_index, self.index)
             new_key = KeyRoll(current_key, x)
-            self.lattice.add_key(new_index, new_key)
+            self.lattice.add_key(new_index, new_key, predecessor_index=current_index)
+
+            # Visualization
+            self.lattice.visualize_lattice(self.index)
+
+            #  Print the key update information
+            key_repr = hashlib.sha256(new_key).hexdigest()[:8]
+            print(f"Cycle {cycle}: Participant {self.index} performed a key update.")
+            print(f"  New index: {new_index}, Key hash: {key_repr}")
+            self.lattice.print_lattice()
         update_message = {
             'sender': self.index,
             'index': new_index,
@@ -102,7 +131,10 @@ class Participant:
     async def receive_secure(self, sender_index, nonce, ciphertext):
         key = self.pairwise_keys[sender_index]
         aead = ChaCha20Poly1305(key)
-        plaintext = aead.decrypt(nonce, ciphertext, None)
+        try:
+            plaintext = aead.decrypt(nonce, ciphertext, None)
+        except cryptography.exceptions.InvalidTag:
+            print(f"Participant {self.index}: Failed to decrypt secure message from Participant {sender_index}.")
         message = eval(plaintext.decode('utf-8'))
         await self.process_update(message)
 
@@ -119,7 +151,7 @@ class Participant:
             if preceding_index in self.lattice.lattice:
                 k = self.lattice.lattice[preceding_index]
                 k_prime = KeyRoll(k, x)
-                self.lattice.add_key(index, k_prime)
+                self.lattice.add_key(index, k_prime, predecessor_index=preceding_index)
                 await self.process_buffered_updates()
                 await self.try_decrypt_buffered_messages()
             else:
@@ -142,7 +174,7 @@ class Participant:
                     self.update_buffer.remove(update_message)
         await self.try_decrypt_buffered_messages()
 
-    async def send_message(self, message):
+    async def send_message(self, message, cycle):
         with self.lattice.lattice_lock:
             max_key, max_index = self.lattice.get_max_key()
             hashed_key = hashlib.sha256(max_key).digest()
@@ -201,6 +233,11 @@ participant_objects = {}
 # Initialize participants with initial key k0
 initial_key = os.urandom(32)
 
+# Print the initial key k0 (represented securely)
+initial_key_repr = hashlib.sha256(initial_key).hexdigest()[:8]
+print()
+print(f"Initial group key k0 hash: {initial_key_repr}\n")
+
 # Initialize participants with their pairwise keys
 for i in participants:
     participant_pairwise_keys = {}
@@ -214,21 +251,29 @@ for i in participants:
     participant_objects[i] = Participant(i, initial_key, participant_pairwise_keys)
 
 async def simulate_protocol():
-    # Simulate key updates and message sending
-    await asyncio.gather(
-        participant_objects[0].send_update(),
-        participant_objects[1].send_update(),
-        participant_objects[2].send_update(),
-    )
-    await asyncio.gather(
-        participant_objects[0].send_message("Hello from participant 0"),
-        participant_objects[1].send_message("Hello from participant 1"),
-        participant_objects[2].send_message("Hello from participant 2"),
-    )
-    # Participants can attempt to forget old keys based on some logic
-    window_index = (1, 1, 1)
-    for p in participant_objects.values():
-        p.forget(window_index)
+    num_cycles = 4  # Number of cycles to run the simulation
+    for cycle in range(1, num_cycles + 1):
+        print(f"\n=== Cycle {cycle} ===")
+        # Each participant may perform a key update
+        await asyncio.gather(
+            *[participant_objects[i].maybe_send_update(cycle) for i in participants]
+        )
+        # Each participant sends a message
+        await asyncio.gather(
+            *[participant_objects[i].send_message(f"Message from participant {i} at cycle {cycle}", cycle) for i in participants]
+        )
+
+        # Visualize the lattice for each participant
+        for i in participants:
+            participant_objects[i].lattice.visualize_lattice(i)
+
+        print()
+    # Allow time for any remaining buffered messages to be decrypted
+    await asyncio.sleep(1)
+    # Optionally, after the simulation, print the final lattice state for each participant
+    for i in participants:
+        print(f"\nFinal lattice state for Participant {i}:")
+        participant_objects[i].lattice.print_lattice()
 
 # Run the simulation
 asyncio.run(simulate_protocol())
